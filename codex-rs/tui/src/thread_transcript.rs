@@ -25,6 +25,23 @@ pub(crate) enum RawReasoningVisibility {
     Visible,
 }
 
+pub(crate) fn is_internal_spine_ui_item(item: &ThreadItem) -> bool {
+    let ThreadItem::McpToolCall {
+        id,
+        server,
+        tool,
+        mcp_app_resource_uri,
+        ..
+    } = item
+    else {
+        return false;
+    };
+    id.starts_with("spine-ui-")
+        && server == "__codex_internal_spine_tree_ui__"
+        && tool == "spine_tree"
+        && mcp_app_resource_uri.as_deref() == Some("ui://spine/tree.html")
+}
+
 pub(crate) async fn load_session_transcript(
     app_server: &mut AppServerSession,
     thread_id: ThreadId,
@@ -121,6 +138,9 @@ pub(crate) fn thread_to_transcript_cells(
 }
 
 fn fallback_transcript_cell(item: &ThreadItem) -> Option<PlainHistoryCell> {
+    if is_internal_spine_ui_item(item) {
+        return None;
+    }
     let lines = match item {
         ThreadItem::HookPrompt { fragments, .. } => fragments
             .iter()

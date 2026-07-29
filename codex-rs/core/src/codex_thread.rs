@@ -23,6 +23,8 @@ use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::AdditionalContextEntry;
 use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::Event;
+use codex_protocol::protocol::EventMsg;
+use codex_protocol::protocol::ItemCompletedEvent;
 use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
@@ -248,6 +250,16 @@ impl CodexThread {
     #[doc(hidden)]
     pub async fn flush_rollout(&self) -> std::io::Result<()> {
         self.codex.session.flush_rollout().await
+    }
+
+    /// Persists an app-server-owned completed item without adding it to model context or
+    /// re-emitting it through the live event stream.
+    #[doc(hidden)]
+    pub async fn persist_client_item_completed(&self, event: ItemCompletedEvent) {
+        self.codex
+            .session
+            .persist_rollout_items(&[RolloutItem::EventMsg(EventMsg::ItemCompleted(event))])
+            .await;
     }
 
     pub async fn submit_with_trace(

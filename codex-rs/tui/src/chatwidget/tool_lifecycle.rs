@@ -4,6 +4,7 @@
 //! events as transcript cells.
 
 use super::*;
+use crate::thread_transcript::is_internal_spine_ui_item;
 use codex_utils_path_uri::LegacyAppPathString;
 
 impl ChatWidget {
@@ -53,6 +54,9 @@ impl ChatWidget {
     }
 
     pub(super) fn on_mcp_tool_call_started(&mut self, item: ThreadItem) {
+        if is_internal_spine_ui_item(&item) {
+            return;
+        }
         let item2 = item.clone();
         self.defer_or_handle(
             |q| q.push_item_started(item),
@@ -61,6 +65,9 @@ impl ChatWidget {
     }
 
     pub(super) fn on_mcp_tool_call_completed(&mut self, item: ThreadItem) {
+        if is_internal_spine_ui_item(&item) {
+            return;
+        }
         let item2 = item.clone();
         self.defer_or_handle(
             |q| q.push_item_completed(item),

@@ -27,6 +27,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Display;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -350,18 +351,16 @@ async fn execute_batch(
     }
     let progress_statuses = Arc::new(tokio::sync::Mutex::new(progress_statuses));
     for call_ordinal in 0..progress_calls.len() {
-        session
-            .emit_spine_spawn_progress(
-                turn.as_ref(),
-                batch_progress_event(
-                    progress_calls.as_ref(),
-                    call_ordinal,
-                    progress_thread_ids.as_ref(),
-                    progress_paths.as_ref(),
-                    &progress_statuses.lock().await,
-                ),
-            )
-            .await;
+        session.emit_spine_spawn_progress(
+            turn.as_ref(),
+            batch_progress_event(
+                progress_calls.as_ref(),
+                call_ordinal,
+                progress_thread_ids.as_ref(),
+                progress_paths.as_ref(),
+                &progress_statuses.lock().await,
+            ),
+        );
     }
     let waits = live.iter().map(|(ordinal, thread_id, _)| {
         let control = session.services.agent_control.clone();
@@ -375,22 +374,40 @@ async fn execute_batch(
         let call_ordinal = flat_tasks[ordinal].0;
         let thread_id = *thread_id;
         async move {
-            let status = wait_for_terminal(&control, thread_id).await;
-            let result = result_from_status(ordinal, thread_id, status);
-            let event = {
-                let mut statuses = progress_statuses.lock().await;
-                statuses[ordinal] = result_status(&result);
-                batch_progress_event(
-                    progress_calls.as_ref(),
-                    call_ordinal,
-                    progress_thread_ids.as_ref(),
-                    progress_paths.as_ref(),
-                    &statuses,
-                )
+            let mut emit_status = |status: AgentStatus| {
+                let session = session.clone();
+                let turn = turn.clone();
+                let progress_calls = progress_calls.clone();
+                let progress_thread_ids = progress_thread_ids.clone();
+                let progress_paths = progress_paths.clone();
+                let progress_statuses = progress_statuses.clone();
+                async move {
+                    let mut statuses = progress_statuses.lock().await;
+                    if statuses[ordinal] == status {
+                        return;
+                    }
+                    statuses[ordinal] = status;
+                    let event = batch_progress_event(
+                        progress_calls.as_ref(),
+                        call_ordinal,
+                        progress_thread_ids.as_ref(),
+                        progress_paths.as_ref(),
+                        &statuses,
+                    );
+                    session.emit_spine_spawn_progress(turn.as_ref(), event);
+                }
             };
-            session
-                .emit_spine_spawn_progress(turn.as_ref(), event)
-                .await;
+            let status = match control.subscribe_status(thread_id).await {
+                Ok(status_rx) => {
+                    match wait_for_terminal_status(status_rx, &mut emit_status).await {
+                        Some(status) => status,
+                        None => control.get_status(thread_id).await,
+                    }
+                }
+                Err(_) => control.get_status(thread_id).await,
+            };
+            let result = result_from_status(ordinal, thread_id, status);
+            emit_status(result_status(&result)).await;
             (ordinal, result)
         }
     });
@@ -466,9 +483,7 @@ async fn execute_batch(
                 .collect::<Vec<_>>()
         };
         for event in events {
-            session
-                .emit_spine_spawn_progress(turn.as_ref(), event)
-                .await;
+            session.emit_spine_spawn_progress(turn.as_ref(), event);
         }
     }
 
@@ -679,7 +694,7 @@ fn classify_start_results<E: Display>(
 fn transaction_task_name(call_id: &str, ordinal: usize) -> String {
     let fragment = call_id
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .map(|character| character.to_ascii_lowercase())
         .take(20)
         .collect::<String>();
@@ -698,20 +713,22 @@ fn task_envelope(task: &SpawnTask) -> String {
     )
 }
 
-async fn wait_for_terminal(
-    control: &crate::agent::AgentControl,
-    thread_id: ThreadId,
-) -> AgentStatus {
-    let Ok(mut status_rx) = control.subscribe_status(thread_id).await else {
-        return control.get_status(thread_id).await;
-    };
+async fn wait_for_terminal_status<F, Fut>(
+    mut status_rx: tokio::sync::watch::Receiver<AgentStatus>,
+    mut on_progress: F,
+) -> Option<AgentStatus>
+where
+    F: FnMut(AgentStatus) -> Fut,
+    Fut: Future<Output = ()>,
+{
     loop {
         let status = status_rx.borrow_and_update().clone();
         if is_spawn_terminal(&status) {
-            return status;
+            return Some(status);
         }
+        on_progress(status).await;
         if status_rx.changed().await.is_err() {
-            return control.get_status(thread_id).await;
+            return None;
         }
     }
 }

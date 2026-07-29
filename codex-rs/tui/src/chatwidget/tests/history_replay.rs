@@ -1028,6 +1028,33 @@ async fn replayed_in_progress_mcp_tool_call_stays_active() {
 }
 
 #[tokio::test]
+async fn replayed_internal_spine_ui_item_is_not_rendered() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
+    let _ = drain_insert_history(&mut rx);
+
+    chat.replay_thread_item(
+        AppServerThreadItem::McpToolCall {
+            id: "spine-ui-turn-1".to_string(),
+            server: "__codex_internal_spine_tree_ui__".to_string(),
+            tool: "spine_tree".to_string(),
+            status: codex_app_server_protocol::McpToolCallStatus::Completed,
+            arguments: json!({}),
+            app_context: None,
+            mcp_app_resource_uri: Some("ui://spine/tree.html".to_string()),
+            plugin_id: None,
+            result: None,
+            error: None,
+            duration_ms: None,
+        },
+        "turn-1".to_string(),
+        ReplayKind::ThreadSnapshot,
+    );
+
+    assert!(drain_insert_history(&mut rx).is_empty());
+    assert!(chat.transcript.active_cell.is_none());
+}
+
+#[tokio::test]
 async fn live_reasoning_summary_is_not_rendered_twice_when_item_completes() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(/*model_override*/ None).await;
     chat.show_welcome_banner = false;

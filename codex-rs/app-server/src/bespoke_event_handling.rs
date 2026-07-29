@@ -188,6 +188,13 @@ pub(crate) async fn apply_bespoke_event_handling(
             thread_watch_manager
                 .note_turn_completed(&conversation_id.to_string(), turn_failed)
                 .await;
+            persist_spine_ui_item_completed(
+                conversation_id,
+                &event_turn_id,
+                &conversation,
+                &thread_state,
+            )
+            .await;
             handle_turn_complete(
                 conversation_id,
                 event_turn_id,
@@ -1052,6 +1059,13 @@ pub(crate) async fn apply_bespoke_event_handling(
             thread_watch_manager
                 .note_turn_interrupted(&conversation_id.to_string())
                 .await;
+            persist_spine_ui_item_completed(
+                conversation_id,
+                &event_turn_id,
+                &conversation,
+                &thread_state,
+            )
+            .await;
             handle_turn_interrupted(
                 conversation_id,
                 event_turn_id,
@@ -1153,6 +1167,24 @@ pub(crate) async fn apply_bespoke_event_handling(
             .await;
         }
         EventMsg::SpineTreeUpdate(spine_tree_event) => {
+            if crate::spine_ui::is_enabled() {
+                let live_spine_ui = {
+                    let mut state = thread_state.lock().await;
+                    state.record_spine_ui_snapshot(spine_tree_event.clone());
+                    state.live_spine_ui(&event_turn_id).cloned()
+                };
+                if let Some(notification) = live_spine_ui.as_ref().and_then(|spine_ui| {
+                    crate::spine_ui::snapshot_started_notification(
+                        &conversation_id.to_string(),
+                        &event_turn_id,
+                        spine_ui,
+                    )
+                }) {
+                    outgoing
+                        .send_server_notification(ServerNotification::ItemStarted(notification))
+                        .await;
+                }
+            }
             let notification = item_event_to_server_notification(
                 EventMsg::SpineTreeUpdate(spine_tree_event),
                 &conversation_id.to_string(),
@@ -1161,6 +1193,24 @@ pub(crate) async fn apply_bespoke_event_handling(
             outgoing.send_server_notification(notification).await;
         }
         EventMsg::SpineSpawnProgress(progress) => {
+            if crate::spine_ui::is_enabled() {
+                let live_spine_ui = {
+                    let mut state = thread_state.lock().await;
+                    state.record_spine_ui_spawn_progress(progress.clone());
+                    state.live_spine_ui(&event_turn_id).cloned()
+                };
+                if let Some(notification) = live_spine_ui.as_ref().and_then(|spine_ui| {
+                    crate::spine_ui::snapshot_started_notification(
+                        &conversation_id.to_string(),
+                        &event_turn_id,
+                        spine_ui,
+                    )
+                }) {
+                    outgoing
+                        .send_server_notification(ServerNotification::ItemStarted(notification))
+                        .await;
+                }
+            }
             let notification = item_event_to_server_notification(
                 EventMsg::SpineSpawnProgress(progress),
                 &conversation_id.to_string(),
@@ -1406,7 +1456,7 @@ async fn find_and_remove_turn_summary(
     thread_state: &Arc<Mutex<ThreadState>>,
 ) -> TurnSummary {
     let mut state = thread_state.lock().await;
-    std::mem::take(&mut state.turn_summary)
+    state.take_turn_summary()
 }
 
 async fn handle_turn_complete(
@@ -1417,6 +1467,8 @@ async fn handle_turn_complete(
     thread_state: &Arc<Mutex<ThreadState>>,
 ) {
     let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
+
+    emit_spine_ui_item_completed(conversation_id, &event_turn_id, &turn_summary, outgoing).await;
 
     let (status, error) = match turn_summary.last_error {
         Some(error) => (TurnStatus::Failed, Some(error)),
@@ -1447,6 +1499,8 @@ async fn handle_turn_interrupted(
 ) {
     let turn_summary = find_and_remove_turn_summary(conversation_id, thread_state).await;
 
+    emit_spine_ui_item_completed(conversation_id, &event_turn_id, &turn_summary, outgoing).await;
+
     emit_turn_completed_with_status(
         conversation_id,
         event_turn_id,
@@ -1460,6 +1514,54 @@ async fn handle_turn_interrupted(
         outgoing,
     )
     .await;
+}
+
+async fn emit_spine_ui_item_completed(
+    conversation_id: ThreadId,
+    turn_id: &str,
+    turn_summary: &TurnSummary,
+    outgoing: &ThreadScopedOutgoingMessageSender,
+) {
+    if !crate::spine_ui::is_enabled() {
+        return;
+    }
+    let Some(spine_ui) = turn_summary.active_spine_ui(turn_id) else {
+        return;
+    };
+    let Some(notification) = crate::spine_ui::snapshot_completed_notification(
+        &conversation_id.to_string(),
+        turn_id,
+        spine_ui,
+    ) else {
+        return;
+    };
+    outgoing
+        .send_server_notification(ServerNotification::ItemCompleted(notification))
+        .await;
+}
+
+async fn persist_spine_ui_item_completed(
+    conversation_id: ThreadId,
+    turn_id: &str,
+    conversation: &CodexThread,
+    thread_state: &Arc<Mutex<ThreadState>>,
+) {
+    if !crate::spine_ui::is_enabled() {
+        return;
+    }
+    let spine_ui = {
+        let state = thread_state.lock().await;
+        state.turn_summary.active_spine_ui(turn_id).cloned()
+    };
+    let Some(spine_ui) = spine_ui else {
+        return;
+    };
+    let Some(event) =
+        crate::spine_ui::snapshot_completed_event(conversation_id, turn_id, &spine_ui)
+    else {
+        return;
+    };
+    conversation.persist_client_item_completed(event).await;
 }
 
 async fn handle_thread_rollback_failed(

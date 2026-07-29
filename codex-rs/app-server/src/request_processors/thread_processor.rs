@@ -887,6 +887,7 @@ impl ThreadRequestProcessor {
     fn listener_task_context(&self) -> ListenerTaskContext {
         ListenerTaskContext {
             thread_manager: Arc::clone(&self.thread_manager),
+            thread_store: Arc::clone(&self.thread_store),
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
@@ -989,6 +990,7 @@ impl ThreadRequestProcessor {
         typesafe_overrides.ephemeral = ephemeral;
         let listener_task_context = ListenerTaskContext {
             thread_manager: Arc::clone(&self.thread_manager),
+            thread_store: Arc::clone(&self.thread_store),
             thread_state_manager: self.thread_state_manager.clone(),
             outgoing: Arc::clone(&self.outgoing),
             pending_thread_unloads: Arc::clone(&self.pending_thread_unloads),
@@ -2510,19 +2512,31 @@ impl ThreadRequestProcessor {
                 }
                 err => internal_error(format!("failed to list thread items: {err}")),
             })?;
-        let data =
-            page.items
-                .into_iter()
-                .map(|item| {
+        let spine_ui_enabled = crate::spine_ui::is_enabled();
+        let data = page
+            .items
+            .into_iter()
+            .map(|item| {
+                let thread_item =
                     serde_json::from_slice::<ThreadItem>(&item.materialized_thread_item_json)
                         .map_err(|err| {
                             internal_error(format!(
                                 "failed to deserialize stored thread item {}: {err}",
                                 item.item_key
                             ))
-                        })
-                })
-                .collect::<Result<Vec<_>, _>>()?;
+                        })?;
+                Ok((item.turn_id, thread_item))
+            })
+            .collect::<Result<Vec<_>, JSONRPCErrorError>>()?
+            .into_iter()
+            .filter_map(|(turn_id, item)| {
+                let hidden = !spine_ui_enabled
+                    && turn_id.as_deref().is_some_and(|turn_id| {
+                        crate::spine_ui::is_internal_thread_item(turn_id, &item)
+                    });
+                (!hidden).then_some(item)
+            })
+            .collect();
 
         Ok(ThreadItemsListResponse {
             data,
@@ -3093,8 +3107,16 @@ impl ThreadRequestProcessor {
                     .await;
                 let is_running =
                     matches!(existing_thread.agent_status().await, AgentStatus::Running);
+                let has_timed_out_spine_ui_children = self
+                    .thread_state_manager
+                    .has_timed_out_spine_ui_children(existing_thread_id)
+                    .await;
 
-                if !has_subscribers && matches!(loaded_status, ThreadStatus::Idle) && !is_running {
+                if !has_subscribers
+                    && matches!(loaded_status, ThreadStatus::Idle)
+                    && !is_running
+                    && !has_timed_out_spine_ui_children
+                {
                     // A loaded idle thread is only a cache entry. Shut it down
                     // before removing it so cold resume cannot duplicate a
                     // thread that timed out during shutdown.

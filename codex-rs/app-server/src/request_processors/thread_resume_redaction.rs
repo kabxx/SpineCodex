@@ -16,7 +16,24 @@ pub(super) fn should_redact_thread_resume_payloads(client_name: Option<&str>) ->
 
 pub(super) fn redact_thread_resume_payloads(turns: &mut [Turn]) {
     for turn in turns {
+        let turn_id = turn.id.clone();
         turn.items.retain_mut(|item| match item {
+            ThreadItem::McpToolCall {
+                id,
+                server,
+                tool,
+                mcp_app_resource_uri,
+                ..
+            } if crate::spine_ui::is_internal_history_item(
+                &turn_id,
+                id,
+                server,
+                tool,
+                mcp_app_resource_uri.as_deref(),
+            ) =>
+            {
+                true
+            }
             ThreadItem::McpToolCall {
                 arguments,
                 result,
@@ -185,6 +202,67 @@ mod tests {
                 duration_ms: Some(8),
             }
         );
+    }
+
+    #[test]
+    fn keeps_internal_spine_tree_payload_for_remote_resume() {
+        let item = ThreadItem::McpToolCall {
+            id: "spine-ui-turn-1".to_string(),
+            server: crate::spine_ui::SERVER_NAME.to_string(),
+            tool: crate::spine_ui::TOOL_NAME.to_string(),
+            status: McpToolCallStatus::Completed,
+            arguments: serde_json::json!({}),
+            app_context: None,
+            mcp_app_resource_uri: Some(crate::spine_ui::RESOURCE_URI.to_string()),
+            plugin_id: None,
+            result: Some(Box::new(McpToolCallResult {
+                content: Vec::new(),
+                structured_content: Some(serde_json::json!({
+                    "schemaVersion": 1,
+                    "snapshot": {"nodes": []}
+                })),
+                meta: Some(serde_json::json!({"openai/widgetSessionId": "spine-ui-turn-1"})),
+            })),
+            error: None,
+            duration_ms: None,
+        };
+        let mut thread = test_thread(vec![item.clone()]);
+
+        redact_thread_resume_payloads(&mut thread.turns);
+
+        assert_eq!(thread.turns[0].items, vec![item]);
+    }
+
+    #[test]
+    fn redacts_real_mcp_that_uses_the_reserved_server_and_tool_names() {
+        let mut thread = test_thread(vec![ThreadItem::McpToolCall {
+            id: "spine-ui-wrong-turn".to_string(),
+            server: crate::spine_ui::SERVER_NAME.to_string(),
+            tool: crate::spine_ui::TOOL_NAME.to_string(),
+            status: McpToolCallStatus::Completed,
+            arguments: serde_json::json!({"secret":"argument"}),
+            app_context: None,
+            mcp_app_resource_uri: Some(crate::spine_ui::RESOURCE_URI.to_string()),
+            plugin_id: None,
+            result: Some(Box::new(McpToolCallResult {
+                content: vec![serde_json::json!({"type":"text","text":"secret result"})],
+                structured_content: Some(serde_json::json!({"secret":"result"})),
+                meta: None,
+            })),
+            error: None,
+            duration_ms: None,
+        }]);
+
+        redact_thread_resume_payloads(&mut thread.turns);
+
+        let ThreadItem::McpToolCall {
+            arguments, result, ..
+        } = &thread.turns[0].items[0]
+        else {
+            panic!("expected MCP tool call");
+        };
+        assert_eq!(arguments, &JsonValue::String(REDACTED_PAYLOAD.to_string()));
+        assert_eq!(result.as_deref(), Some(&redacted_mcp_tool_call_result()));
     }
 
     fn test_thread(items: Vec<ThreadItem>) -> Thread {

@@ -608,6 +608,12 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::Extension(_)
             | codex_protocol::items::TurnItem::EnteredReviewMode(_)
             | codex_protocol::items::TurnItem::ExitedReviewMode(_) => true,
+            codex_protocol::items::TurnItem::McpToolCall(item) => {
+                item.id == format!("spine-ui-{turn_id}")
+                    && item.server == "__codex_internal_spine_tree_ui__"
+                    && item.tool == "spine_tree"
+                    && item.mcp_app_resource_uri.as_deref() == Some("ui://spine/tree.html")
+            }
             codex_protocol::items::TurnItem::UserMessage(_)
             | codex_protocol::items::TurnItem::AgentMessage(_)
             | codex_protocol::items::TurnItem::Reasoning(_)
@@ -615,7 +621,6 @@ impl ThreadHistoryBuilder {
             | codex_protocol::items::TurnItem::ImageView(_)
             | codex_protocol::items::TurnItem::ImageGeneration(_)
             | codex_protocol::items::TurnItem::FileChange(_)
-            | codex_protocol::items::TurnItem::McpToolCall(_)
             | codex_protocol::items::TurnItem::ContextCompaction(_) => false,
         };
 
@@ -1508,12 +1513,45 @@ fn upsert_turn_item(items: &mut Vec<ThreadItem>, item: ThreadItem) -> &ThreadIte
         .iter()
         .position(|existing_item| existing_item.id() == item.id())
     {
+        let existing_revision = internal_spine_ui_revision(&items[existing_item_index]);
+        let incoming_revision = internal_spine_ui_revision(&item);
+        if existing_revision.is_some()
+            && incoming_revision.is_none_or(|incoming| Some(incoming) < existing_revision)
+        {
+            return &items[existing_item_index];
+        }
         items[existing_item_index] = item;
         return &items[existing_item_index];
     }
     let inserted_item_index = items.len();
     items.push(item);
     &items[inserted_item_index]
+}
+
+fn internal_spine_ui_revision(item: &ThreadItem) -> Option<u64> {
+    let ThreadItem::McpToolCall {
+        id,
+        server,
+        tool,
+        mcp_app_resource_uri,
+        result: Some(result),
+        ..
+    } = item
+    else {
+        return None;
+    };
+    if !id.starts_with("spine-ui-")
+        || server != "__codex_internal_spine_tree_ui__"
+        || tool != "spine_tree"
+        || mcp_app_resource_uri.as_deref() != Some("ui://spine/tree.html")
+    {
+        return None;
+    }
+    result
+        .structured_content
+        .as_ref()?
+        .get("uiRevision")?
+        .as_u64()
 }
 
 struct PendingTurn {
@@ -1632,6 +1670,119 @@ mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn materialized_history_only_keeps_genuine_internal_spine_items() {
+        let internal = CoreTurnItem::McpToolCall(codex_protocol::items::McpToolCallItem {
+            id: "spine-ui-turn-1".into(),
+            server: "__codex_internal_spine_tree_ui__".into(),
+            tool: "spine_tree".into(),
+            arguments: serde_json::json!({}),
+            connector_id: None,
+            mcp_app_resource_uri: Some("ui://spine/tree.html".into()),
+            link_id: None,
+            app_name: None,
+            template_id: None,
+            action_name: None,
+            plugin_id: None,
+            status: codex_protocol::items::McpToolCallStatus::Completed,
+            result: None,
+            error: None,
+            duration: None,
+        });
+        let configured_collision =
+            CoreTurnItem::McpToolCall(codex_protocol::items::McpToolCallItem {
+                id: "spine-ui-wrong-turn".into(),
+                server: "__codex_internal_spine_tree_ui__".into(),
+                tool: "spine_tree".into(),
+                arguments: serde_json::json!({"secret": true}),
+                connector_id: None,
+                mcp_app_resource_uri: Some("ui://spine/tree.html".into()),
+                link_id: None,
+                app_name: None,
+                template_id: None,
+                action_name: None,
+                plugin_id: None,
+                status: codex_protocol::items::McpToolCallStatus::Completed,
+                result: None,
+                error: None,
+                duration: None,
+            });
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+
+        builder.handle_materialized_item_lifecycle("turn-1", &internal);
+        builder.handle_materialized_item_lifecycle("turn-1", &configured_collision);
+
+        let turn = builder.active_turn_snapshot().expect("active turn");
+        assert_eq!(turn.items.len(), 1);
+        assert_eq!(turn.items[0].id(), "spine-ui-turn-1");
+    }
+
+    #[test]
+    fn materialized_history_keeps_the_highest_spine_ui_revision() {
+        let item_at_revision = |revision| {
+            CoreTurnItem::McpToolCall(codex_protocol::items::McpToolCallItem {
+                id: "spine-ui-turn-1".into(),
+                server: "__codex_internal_spine_tree_ui__".into(),
+                tool: "spine_tree".into(),
+                arguments: serde_json::json!({}),
+                connector_id: None,
+                mcp_app_resource_uri: Some("ui://spine/tree.html".into()),
+                link_id: None,
+                app_name: None,
+                template_id: None,
+                action_name: None,
+                plugin_id: None,
+                status: codex_protocol::items::McpToolCallStatus::Completed,
+                result: Some(CallToolResult {
+                    content: Vec::new(),
+                    structured_content: Some(serde_json::json!({
+                        "schemaVersion": 1,
+                        "uiRevision": revision,
+                        "snapshot": {"nodes": []}
+                    })),
+                    is_error: Some(false),
+                    meta: None,
+                }),
+                error: None,
+                duration: None,
+            })
+        };
+        let mut builder = ThreadHistoryBuilder::new();
+        builder.handle_event(&EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-1".into(),
+            trace_id: None,
+            started_at: None,
+            model_context_window: None,
+            collaboration_mode_kind: Default::default(),
+        }));
+
+        builder.handle_materialized_item_lifecycle("turn-1", &item_at_revision(8));
+        builder.handle_materialized_item_lifecycle("turn-1", &item_at_revision(7));
+
+        let turn = builder.active_turn_snapshot().expect("active turn");
+        let ThreadItem::McpToolCall {
+            result: Some(result),
+            ..
+        } = &turn.items[0]
+        else {
+            panic!("expected completed MCP item");
+        };
+        assert_eq!(
+            result
+                .structured_content
+                .as_ref()
+                .expect("structured content")["uiRevision"],
+            8
+        );
+    }
 
     #[test]
     fn builds_multiple_turns_with_reasoning_items() {

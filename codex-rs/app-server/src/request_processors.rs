@@ -632,5 +632,7 @@ pub(crate) fn build_legacy_api_turns_from_rollout_items(items: &[RolloutItem]) -
             builder.handle_rollout_item(item);
         }
     }
-    builder.finish()
+    let mut turns = builder.finish();
+    crate::spine_ui::hide_internal_history_items_when_disabled(&mut turns);
+    turns
 }

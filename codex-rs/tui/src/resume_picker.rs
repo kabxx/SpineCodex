@@ -5825,6 +5825,83 @@ session_picker_view = "dense"
     }
 
     #[test]
+    fn thread_to_transcript_cells_hides_internal_spine_ui_items() {
+        use crate::thread_transcript::thread_to_transcript_cells;
+
+        let thread_id = ThreadId::new();
+        let thread = Thread {
+            id: thread_id.to_string(),
+            extra: None,
+            session_id: thread_id.to_string(),
+            forked_from_id: None,
+            parent_thread_id: None,
+            preview: String::from("preview"),
+            ephemeral: false,
+            history_mode: Default::default(),
+            model_provider: String::from("openai"),
+            created_at: 1,
+            updated_at: 2,
+            recency_at: Some(2),
+            status: codex_app_server_protocol::ThreadStatus::Idle,
+            path: None,
+            cwd: test_path_buf("/tmp").abs(),
+            cli_version: String::from("0.0.0"),
+            source: codex_app_server_protocol::SessionSource::Cli,
+            thread_source: None,
+            agent_nickname: None,
+            agent_role: None,
+            git_info: None,
+            name: None,
+            turns: vec![codex_app_server_protocol::Turn {
+                id: String::from("turn-1"),
+                items_view: codex_app_server_protocol::TurnItemsView::Full,
+                items: vec![
+                    ThreadItem::McpToolCall {
+                        id: String::from("spine-ui-turn-1"),
+                        server: String::from("__codex_internal_spine_tree_ui__"),
+                        tool: String::from("spine_tree"),
+                        status: codex_app_server_protocol::McpToolCallStatus::Completed,
+                        arguments: serde_json::json!({}),
+                        app_context: None,
+                        mcp_app_resource_uri: Some(String::from("ui://spine/tree.html")),
+                        plugin_id: None,
+                        result: None,
+                        error: None,
+                        duration_ms: None,
+                    },
+                    ThreadItem::McpToolCall {
+                        id: String::from("mcp-1"),
+                        server: String::from("ordinary-server"),
+                        tool: String::from("ordinary-tool"),
+                        status: codex_app_server_protocol::McpToolCallStatus::Completed,
+                        arguments: serde_json::json!({}),
+                        app_context: None,
+                        mcp_app_resource_uri: None,
+                        plugin_id: None,
+                        result: None,
+                        error: None,
+                        duration_ms: None,
+                    },
+                ],
+                status: codex_app_server_protocol::TurnStatus::Completed,
+                error: None,
+                started_at: None,
+                completed_at: None,
+                duration_ms: None,
+            }],
+        };
+
+        let rendered = thread_to_transcript_cells(&thread, RawReasoningVisibility::Visible)
+            .into_iter()
+            .flat_map(|cell| cell.transcript_lines(/*width*/ 80))
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_snapshot!(rendered, @"mcp tool: ordinary-server/ordinary-tool · Completed");
+    }
+
+    #[test]
     fn thread_to_transcript_cells_hides_raw_reasoning_when_not_enabled() {
         use crate::thread_transcript::thread_to_transcript_cells;
 

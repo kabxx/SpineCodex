@@ -372,6 +372,7 @@ impl MessageProcessor {
         let mcp_processor = McpRequestProcessor::new(
             auth_manager.clone(),
             Arc::clone(&thread_manager),
+            thread_state_manager.clone(),
             outgoing.clone(),
             config_manager.clone(),
         );
@@ -419,6 +420,7 @@ impl MessageProcessor {
             arg0_paths.clone(),
             Arc::clone(&config),
             config_manager.clone(),
+            Arc::clone(&thread_store),
             pending_thread_unloads,
             thread_state_manager,
             thread_watch_manager,

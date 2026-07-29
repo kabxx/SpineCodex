@@ -90,6 +90,15 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
             // Legacy rollouts keep only items with no raw ResponseItem or legacy equivalent.
             matches!(history_mode, ThreadHistoryMode::Paginated)
                 || matches!(event.item, TurnItem::Plan(_) | TurnItem::Sleep(_))
+                || matches!(
+                    &event.item,
+                    TurnItem::McpToolCall(item)
+                        if item.id == format!("spine-ui-{}", event.turn_id)
+                            && item.server == "__codex_internal_spine_tree_ui__"
+                            && item.tool == "spine_tree"
+                            && item.mcp_app_resource_uri.as_deref()
+                                == Some("ui://spine/tree.html")
+                )
         }
         EventMsg::TokenCount(_)
         | EventMsg::ThreadGoalUpdated(_)
@@ -176,3 +185,7 @@ pub fn should_persist_event_msg(ev: &EventMsg, history_mode: ThreadHistoryMode) 
         | EventMsg::CollabResumeBegin(_) => false,
     }
 }
+
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod tests;
