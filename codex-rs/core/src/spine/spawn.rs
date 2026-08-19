@@ -1,29 +1,20 @@
 use crate::agent::AgentStatus;
-use crate::agent::control::SpawnAgentBatchRequest;
-use crate::agent::control::SpawnAgentForkMode;
-use crate::agent::control::SpawnAgentOptions;
-use crate::agent::next_thread_spawn_depth;
 use crate::agent_communication::AgentCommunicationContext;
 use crate::agent_communication::AgentCommunicationKind;
 use crate::session::MailboxSubmissionCancellation;
 use crate::session::session::Session;
 use crate::session::turn_context::TurnContext;
-use crate::tools::handlers::multi_agents_common::build_agent_spawn_config;
-use crate::tools::handlers::multi_agents_common::thread_spawn_source;
 use codex_protocol::AgentPath;
 use codex_protocol::ThreadId;
-use codex_protocol::error::CodexErr;
 use codex_protocol::protocol::InterAgentCommunication;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::SpineSpawnProgressEvent;
 use codex_protocol::protocol::SpineSpawnTaskProgress;
-use codex_protocol::user_input::UserInput;
 use codex_spine_core::SPINE_SPAWN_RESULT_SCHEMA;
 use codex_spine_core::SpawnOutcome;
 use codex_spine_core::SpawnReceipt;
 use codex_spine_core::SpawnResult;
 use codex_spine_core::SpawnTask;
-use futures::future::join_all;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -31,6 +22,7 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::Duration;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 const CORRECTION_MESSAGE: &str = concat!(
@@ -41,7 +33,14 @@ const CORRECTION_MESSAGE: &str = concat!(
     "tool-free assistant final response containing terminal memory. That response\n",
     "ends this branch execution."
 );
+const CONTINUE_AFTER_FAILURE_MESSAGE: &str = concat!(
+    "Continue the same assignment from this branch's existing context. Preserve useful progress ",
+    "from the failed turn, finish the remaining work, and return the required terminal memory."
+);
 pub(crate) const MIN_SPAWN_TASKS: usize = 2;
+
+#[path = "spawn_transaction.rs"]
+mod transaction;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -317,7 +316,14 @@ pub(crate) async fn execute(
         ));
     }
 
-    let batch_result = execute_batch(Arc::clone(&session), turn, cancellation_token, &calls).await;
+    let batch_result = execute_batch(
+        Arc::clone(&session),
+        turn,
+        cancellation_token,
+        &calls,
+        /*show_failure_gate*/ true,
+    )
+    .await;
     match batch_result {
         Ok(receipts) => coordinator.completed.extend(
             receipts
@@ -351,12 +357,18 @@ pub(crate) async fn execute_nested(
         fork_parent_call_id: outer_exec_call_id,
         tasks,
     }];
-    execute_batch(session, turn, cancellation_token, &calls)
-        .await?
-        .remove(&call_id)
-        .ok_or_else(|| {
-            format!("nested spine.spawn batch did not produce a result for call `{call_id}`")
-        })
+    execute_batch(
+        session,
+        turn,
+        cancellation_token,
+        &calls,
+        /*show_failure_gate*/ false,
+    )
+    .await?
+    .remove(&call_id)
+    .ok_or_else(|| {
+        format!("nested spine.spawn batch did not produce a result for call `{call_id}`")
+    })
 }
 
 async fn execute_batch(
@@ -364,363 +376,39 @@ async fn execute_batch(
     turn: Arc<TurnContext>,
     cancellation_token: CancellationToken,
     calls: &[SpawnBatchCall],
+    show_failure_gate: bool,
 ) -> Result<HashMap<String, SpawnReceipt>, String> {
     let calls = calls.to_vec();
-    tokio::spawn(execute_batch_transaction(
+    tokio::spawn(transaction::execute_batch_transaction(
         session,
         turn,
         cancellation_token,
         calls,
+        show_failure_gate,
     ))
     .await
     .map_err(|error| format!("spine.spawn transaction task failed: {error}"))?
-}
-
-async fn execute_batch_transaction(
-    session: Arc<Session>,
-    turn: Arc<TurnContext>,
-    cancellation_token: CancellationToken,
-    calls: Vec<SpawnBatchCall>,
-) -> Result<HashMap<String, SpawnReceipt>, String> {
-    let transaction_guard = session.spine_spawn_lifecycle.try_enter().ok_or_else(|| {
-        "spine.spawn cannot start while another transaction is active or aborting".to_string()
-    })?;
-    let calls = calls.as_slice();
-    if cancellation_token.is_cancelled() {
-        return Err("spine.spawn was cancelled before child creation".to_string());
-    }
-
-    let config = build_agent_spawn_config(&session.get_base_instructions().await, turn.as_ref())
-        .map_err(|error| error.to_string())?;
-    let child_depth = next_thread_spawn_depth(&turn.session_source);
-    let parent_path = turn
-        .session_source
-        .get_agent_path()
-        .unwrap_or_else(AgentPath::root);
-    let task_count = calls.iter().map(|call| call.tasks.len()).sum();
-    let mut child_paths = Vec::with_capacity(task_count);
-    let mut requests = Vec::with_capacity(task_count);
-    let mut flat_tasks = Vec::with_capacity(task_count);
-    for (call_ordinal, call) in calls.iter().enumerate() {
-        for (task_ordinal, task) in call.tasks.iter().enumerate() {
-            let task_name = transaction_task_name(&call.call_id, task_ordinal);
-            let source = thread_spawn_source(
-                session.thread_id,
-                &turn.session_source,
-                child_depth,
-                /*agent_role*/ None,
-                Some(task_name),
-            )
-            .map_err(|error| error.to_string())?;
-            let child_path = source
-                .get_agent_path()
-                .ok_or_else(|| "spine.spawn child is missing an agent path".to_string())?;
-            child_paths.push(child_path);
-            flat_tasks.push((call_ordinal, task_ordinal, task.clone()));
-            // TODO(spine-spawn-context): Verify complete effective parent-context inheritance for
-            // spawned children using native fork_turns="all". Compare the parent pre-spawn
-            // effective context with each child's first model request, including inherited Spine
-            // memory and first-turn cached_tokens, before strengthening this contract.
-            requests.push(
-                SpawnAgentBatchRequest::new(
-                    source,
-                    SpawnAgentOptions {
-                        fork_parent_spawn_call_id: Some(call.fork_parent_call_id.clone()),
-                        fork_mode: Some(SpawnAgentForkMode::FullHistoryTrimToolCallSuffix),
-                        parent_thread_id: Some(session.thread_id),
-                        environments: Some(turn.environments.to_selections()),
-                    },
-                )
-                .suppress_parent_completion_notification(),
-            );
-        }
-    }
-
-    let prepared = match session
-        .services
-        .agent_control
-        .prepare_agent_spawn_batch(config, requests)
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(CodexErr::AgentLimitReached { max_threads }) => {
-            return capacity_rejection_receipts(calls, task_count, max_threads);
-        }
-        Err(error) => return Err(format!("spine.spawn admission failed: {error}")),
-    };
-    if cancellation_token.is_cancelled() {
-        drop(prepared);
-        return Err("spine.spawn was cancelled before child creation".to_string());
-    }
-
-    let starts =
-        prepared
-            .into_iter()
-            .zip(flat_tasks.iter())
-            .map(|(prepared, (call_ordinal, _, task))| {
-                session
-                    .services
-                    .agent_control
-                    .spawn_prepared_agent_with_metadata(
-                        prepared,
-                        vec![UserInput::Text {
-                            text: task_envelope(task, &calls[*call_ordinal].tasks),
-                            text_elements: Vec::new(),
-                        }],
-                    )
-            });
-    let start_results = join_all(starts)
-        .await
-        .into_iter()
-        .map(|result| result.map(|agent| agent.thread_id));
-    let StartPhase {
-        live,
-        mut results,
-        failed: start_failed,
-    } = classify_start_results(&child_paths, start_results);
-    let child_by_path = live
-        .iter()
-        .map(|(_, thread_id, path)| (path.clone(), *thread_id))
-        .collect::<HashMap<_, _>>();
-    let child_thread_ids = live
-        .iter()
-        .map(|(_, thread_id, _)| *thread_id)
-        .collect::<Vec<_>>();
-    let mailbox_cancellation = session
-        .input_queue
-        .mailbox_submission_cancellation(&child_paths);
-    transaction_guard.install_mailbox_cancellation(mailbox_cancellation.clone());
-    if cancellation_token.is_cancelled() {
-        mailbox_cancellation.activate();
-    }
-
-    if start_failed {
-        let mut corrected_ids = HashSet::new();
-        let teardown_result = teardown_transaction_children_with_correction(
-            &session,
-            &parent_path,
-            &child_thread_ids,
-            &child_paths,
-            &child_by_path,
-            &mut corrected_ids,
-        )
-        .await;
-        quiesce_transaction_messages(
-            &session,
-            &parent_path,
-            &child_paths,
-            &child_by_path,
-            &mut corrected_ids,
-        )
-        .await;
-        teardown_result?;
-        for (ordinal, thread_id, _) in &live {
-            let diagnostic =
-                "child aborted because another transaction child failed to start".to_string();
-            results[*ordinal] = Some(error_result(
-                *ordinal,
-                SpawnOutcome::Aborted,
-                diagnostic,
-                Some(thread_id.to_string()),
-            ));
-        }
-        return finish_batch_receipts(calls, results);
-    }
-
-    let progress_calls = Arc::new(calls.to_vec());
-    let progress_paths = Arc::new(child_paths.clone());
-    let mut progress_thread_ids = vec![None; task_count];
-    for (ordinal, thread_id, _) in &live {
-        progress_thread_ids[*ordinal] = Some(*thread_id);
-    }
-    let progress_thread_ids = Arc::new(
-        progress_thread_ids
-            .into_iter()
-            .collect::<Option<Vec<_>>>()
-            .ok_or_else(|| "spine.spawn live child identity is incomplete".to_string())?,
-    );
-    let initial_statuses = join_all(
-        live.iter()
-            .map(|(_, thread_id, _)| session.services.agent_control.get_status(*thread_id)),
-    )
-    .await;
-    let mut progress_statuses = vec![AgentStatus::PendingInit; task_count];
-    for ((ordinal, thread_id, _), status) in live.iter().zip(initial_statuses) {
-        progress_statuses[*ordinal] = normalized_progress_status(*ordinal, *thread_id, status);
-    }
-    let progress_statuses = Arc::new(tokio::sync::Mutex::new(progress_statuses));
-    for call_ordinal in 0..progress_calls.len() {
-        session
-            .emit_spine_spawn_progress(
-                turn.as_ref(),
-                batch_progress_event(
-                    progress_calls.as_ref(),
-                    call_ordinal,
-                    progress_thread_ids.as_ref(),
-                    progress_paths.as_ref(),
-                    &progress_statuses.lock().await,
-                ),
-            )
-            .await;
-    }
-    let waits = live.iter().map(|(ordinal, thread_id, _)| {
-        let control = session.services.agent_control.clone();
-        let session = session.clone();
-        let turn = turn.clone();
-        let progress_calls = progress_calls.clone();
-        let progress_thread_ids = progress_thread_ids.clone();
-        let progress_paths = progress_paths.clone();
-        let progress_statuses = progress_statuses.clone();
-        let ordinal = *ordinal;
-        let call_ordinal = flat_tasks[ordinal].0;
-        let thread_id = *thread_id;
-        async move {
-            let status = wait_for_terminal(&control, thread_id).await;
-            let failure_record = control.take_spawn_failure_record(thread_id).await;
-            let result = result_from_status(ordinal, thread_id, status, failure_record);
-            let event = {
-                let mut statuses = progress_statuses.lock().await;
-                statuses[ordinal] = result_status(&result);
-                batch_progress_event(
-                    progress_calls.as_ref(),
-                    call_ordinal,
-                    progress_thread_ids.as_ref(),
-                    progress_paths.as_ref(),
-                    &statuses,
-                )
-            };
-            session
-                .emit_spine_spawn_progress(turn.as_ref(), event)
-                .await;
-            (ordinal, result)
-        }
-    });
-    let wait_all = join_all(waits);
-    tokio::pin!(wait_all);
-    let mut corrected_ids = HashSet::new();
-    let mut interval = tokio::time::interval(Duration::from_millis(25));
-    let terminal = loop {
-        tokio::select! {
-            statuses = &mut wait_all => break Some(statuses),
-            _ = cancellation_token.cancelled() => break None,
-            _ = interval.tick() => {
-                correct_intermediate_messages(
-                    &session,
-                    &parent_path,
-                    &child_paths,
-                    &child_by_path,
-                    &mut corrected_ids,
-                ).await;
-            }
-        }
-    };
-    correct_intermediate_messages(
-        &session,
-        &parent_path,
-        &child_paths,
-        &child_by_path,
-        &mut corrected_ids,
-    )
-    .await;
-
-    let cancelled = match terminal {
-        Some(completed_results) => {
-            for (ordinal, result) in completed_results {
-                results[ordinal] = Some(result);
-            }
-            false
-        }
-        None => {
-            for (ordinal, thread_id, _) in &live {
-                let status = session.services.agent_control.get_status(*thread_id).await;
-                if is_spawn_terminal(&status) {
-                    let failure_record = session
-                        .services
-                        .agent_control
-                        .take_spawn_failure_record(*thread_id)
-                        .await;
-                    results[*ordinal] = Some(result_from_status(
-                        *ordinal,
-                        *thread_id,
-                        status,
-                        failure_record,
-                    ));
-                }
-            }
-            true
-        }
-    };
-
-    let teardown_result = teardown_transaction_children_with_correction(
-        &session,
-        &parent_path,
-        &child_thread_ids,
-        &child_paths,
-        &child_by_path,
-        &mut corrected_ids,
-    )
-    .await;
-    quiesce_transaction_messages(
-        &session,
-        &parent_path,
-        &child_paths,
-        &child_by_path,
-        &mut corrected_ids,
-    )
-    .await;
-    teardown_result?;
-
-    if cancelled {
-        for (ordinal, thread_id, _) in &live {
-            if results[*ordinal].is_none() {
-                results[*ordinal] = Some(error_result(
-                    *ordinal,
-                    SpawnOutcome::Aborted,
-                    "branch aborted because the originating spine.spawn transaction was cancelled"
-                        .to_string(),
-                    Some(thread_id.to_string()),
-                ));
-            }
-        }
-        let events = {
-            let mut statuses = progress_statuses.lock().await;
-            for (ordinal, result) in results.iter().enumerate() {
-                if let Some(result) = result {
-                    statuses[ordinal] = result_status(result);
-                }
-            }
-            (0..progress_calls.len())
-                .map(|call_ordinal| {
-                    batch_progress_event(
-                        progress_calls.as_ref(),
-                        call_ordinal,
-                        progress_thread_ids.as_ref(),
-                        progress_paths.as_ref(),
-                        &statuses,
-                    )
-                })
-                .collect::<Vec<_>>()
-        };
-        for event in events {
-            session
-                .emit_spine_spawn_progress(turn.as_ref(), event)
-                .await;
-        }
-    }
-
-    finish_batch_receipts(calls, results)
 }
 
 async fn teardown_transaction_children(
     session: &Session,
     transaction_root_thread_ids: &[ThreadId],
 ) -> Result<(), String> {
-    session
+    let result = session
         .services
         .agent_control
         .shutdown_spine_spawn_subtrees(transaction_root_thread_ids)
         .await
-        .map_err(|error| format!("spine.spawn child teardown failed: {error}"))
+        .map_err(|error| format!("spine.spawn child teardown failed: {error}"));
+    // A continuation may be accepted after its Spine slot is committed but before the child
+    // claims the execution guard. Releasing a claimed or already released slot is a no-op.
+    for thread_id in transaction_root_thread_ids {
+        session
+            .services
+            .agent_control
+            .release_execution_reservation(*thread_id);
+    }
+    result
 }
 
 async fn teardown_transaction_children_with_correction(
@@ -917,7 +605,7 @@ fn normalized_progress_status(
     status: AgentStatus,
 ) -> AgentStatus {
     if is_spawn_terminal(&status) {
-        result_status(&result_from_status(ordinal, thread_id, status, None))
+        result_status(&result_from_status(ordinal, thread_id, status))
     } else {
         status
     }
@@ -960,7 +648,7 @@ fn classify_start_results<E: Display>(
 fn transaction_task_name(call_id: &str, ordinal: usize) -> String {
     let fragment = call_id
         .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
+        .filter(char::is_ascii_alphanumeric)
         .map(|character| character.to_ascii_lowercase())
         .take(20)
         .collect::<String>();
@@ -1024,8 +712,31 @@ async fn wait_for_terminal(
     }
 }
 
+async fn wait_for_terminal_after_resume(
+    control: &crate::agent::AgentControl,
+    thread_id: ThreadId,
+    mut status_rx: watch::Receiver<AgentStatus>,
+) -> AgentStatus {
+    if status_rx.changed().await.is_err() {
+        return control.get_status(thread_id).await;
+    }
+    loop {
+        let status = status_rx.borrow_and_update().clone();
+        if is_spawn_terminal(&status) {
+            return status;
+        }
+        if status_rx.changed().await.is_err() {
+            return control.get_status(thread_id).await;
+        }
+    }
+}
+
 fn is_spawn_terminal(status: &AgentStatus) -> bool {
     !matches!(status, AgentStatus::PendingInit | AgentStatus::Running)
+}
+
+fn should_show_failure_gate(show_failure_gate: bool, parent_path: &AgentPath) -> bool {
+    show_failure_gate && parent_path.is_root()
 }
 
 async fn correct_intermediate_messages(
@@ -1088,23 +799,7 @@ fn path_is_in_subtree(candidate: &AgentPath, root: &AgentPath) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn result_from_status(
-    ordinal: usize,
-    thread_id: ThreadId,
-    status: AgentStatus,
-    failure_record: Option<crate::spine::spawn_salvage::SpawnFailureRecord>,
-) -> SpawnResult {
-    if let Some(record) = failure_record {
-        let diagnostic = format!("child errored: {}", record.diagnostic);
-        return SpawnResult {
-            ordinal: ordinal as u32,
-            outcome: SpawnOutcome::Errored,
-            memory_body: record.salvaged_memory.unwrap_or_else(|| diagnostic.clone()),
-            diagnostic: Some(diagnostic),
-            execution_ref: Some(thread_id.to_string()),
-        };
-    }
-
+fn result_from_status(ordinal: usize, thread_id: ThreadId, status: AgentStatus) -> SpawnResult {
     match status {
         AgentStatus::Completed(Some(memory)) if !memory.trim().is_empty() => SpawnResult {
             ordinal: ordinal as u32,

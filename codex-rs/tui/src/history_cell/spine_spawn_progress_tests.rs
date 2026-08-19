@@ -410,6 +410,50 @@ fn truthful_failure_cancels_retiring_success_and_stays_terminal() {
 }
 
 #[test]
+fn normalized_progress_resets_a_failed_child_for_continue() {
+    for restart_status in [CollabAgentStatus::PendingInit, CollabAgentStatus::Running] {
+        let mut overlay = SpineSpawnOverlay::new(single_task(CollabAgentStatus::Running));
+        assert!(overlay.seed_activity(
+            "child",
+            [completed_message("activity from the failed attempt")].into_iter(),
+        ));
+        assert!(overlay.update_status("child", CollabAgentStatus::Errored));
+        assert!(overlay.has_activity("child"));
+
+        overlay.replace_notification(single_task(restart_status));
+
+        assert!(!overlay.has_activity("child"));
+        assert!(overlay.settled_task_visuals().is_none());
+        let rendered = plain_lines(overlay.display_lines("  ", true, 80, false))
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!rendered.contains('×'), "{rendered}");
+        assert!(
+            !rendered.contains("activity from the failed attempt"),
+            "{rendered}"
+        );
+    }
+}
+
+#[test]
+fn direct_out_of_order_status_keeps_terminal_failure_sticky() {
+    let mut overlay = SpineSpawnOverlay::new(single_task(CollabAgentStatus::Running));
+    assert!(overlay.update_status("child", CollabAgentStatus::Interrupted));
+
+    assert!(!overlay.update_status("child", CollabAgentStatus::Running));
+    assert!(overlay.settled_task_visuals().is_some());
+    let rendered = plain_lines(overlay.display_lines("  ", true, 80, false))
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(rendered.contains('!'), "{rendered}");
+    assert!(!rendered.contains("Waiting for activity..."), "{rendered}");
+}
+
+#[test]
 fn late_activity_does_not_mutate_frozen_completion_preview() {
     let mut overlay = SpineSpawnOverlay::new(single_task(CollabAgentStatus::Running));
     assert!(overlay.seed_activity("child", [completed_message("frozen activity")].into_iter(),));
@@ -566,7 +610,6 @@ fn generic_child_failure_waits_for_normalized_progress() {
         .join("\n");
     assert!(!before_progress.contains('×'), "{before_progress}");
     assert!(overlay.update_status("child", CollabAgentStatus::Errored));
-    overlay.replace_notification(progress());
     assert!(!overlay.update_status("child", CollabAgentStatus::Running));
 
     let rendered = plain_lines(overlay.display_lines("  ", true, 80, false))

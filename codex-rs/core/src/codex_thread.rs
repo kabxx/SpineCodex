@@ -207,12 +207,6 @@ impl CodexThread {
         self.codex.session.services.session_telemetry.clone()
     }
 
-    pub(crate) async fn take_spawn_failure_record(
-        &self,
-    ) -> Option<crate::spine::spawn_salvage::SpawnFailureRecord> {
-        self.codex.session.take_spawn_failure_record().await
-    }
-
     pub async fn shutdown_and_wait(&self) -> CodexResult<()> {
         self.codex.shutdown_and_wait().await
     }

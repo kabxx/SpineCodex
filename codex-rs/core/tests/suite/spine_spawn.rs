@@ -13,6 +13,8 @@ use codex_protocol::protocol::MultiAgentVersion;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::RolloutItem;
 use codex_protocol::protocol::RolloutLine;
+use codex_protocol::request_user_input::RequestUserInputAnswer;
+use codex_protocol::request_user_input::RequestUserInputResponse;
 use codex_protocol::user_input::UserInput;
 use codex_spine_core::SPINE_SPAWN_RESULT_SCHEMA;
 use codex_spine_core::SpawnReceipt;
@@ -21,6 +23,7 @@ use core_test_support::responses::ResponsesRequest;
 use core_test_support::responses::ev_assistant_message;
 use core_test_support::responses::ev_completed;
 use core_test_support::responses::ev_custom_tool_call;
+use core_test_support::responses::ev_function_call;
 use core_test_support::responses::ev_function_call_with_namespace;
 use core_test_support::responses::ev_response_created;
 use core_test_support::responses::ev_shell_command_call;
@@ -33,8 +36,10 @@ use core_test_support::test_codex::TestCodex;
 use core_test_support::test_codex::TestCodexBuilder;
 use core_test_support::test_codex::spine_test_codex;
 use core_test_support::wait_for_event;
+use core_test_support::wait_for_event_match;
 use serde_json::Value;
 use serde_json::json;
+use std::collections::HashMap;
 use std::time::Duration;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -46,6 +51,10 @@ const SPAWN_CALL_ID: &str = "spawn-lifecycle-call";
 const FIRST_PARENT_PROMPT: &str = "run the lifecycle spawn batch";
 const SECOND_PARENT_PROMPT: &str = "run the replacement spawn batch";
 const BRANCH_PROMPT_MARKER: &str = "You are a spawned execution branch.";
+const CONTINUE_AFTER_FAILURE_MESSAGE: &str = concat!(
+    "Continue the same assignment from this branch's existing context. Preserve useful progress ",
+    "from the failed turn, finish the remaining work, and return the required terminal memory."
+);
 const CORRECTION_MESSAGE: &str = concat!(
     "This spawned execution branch remains active. Continue exactly the declared\n",
     "assignment and use its declared shared blackboard to collaborate with peer\n",
@@ -243,6 +252,100 @@ async fn wait_for_request(
         }
         sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn choose_spawn_failure_action(test: &TestCodex, answers: &[&str]) -> Result<()> {
+    let request = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::RequestUserInput(request) if request.call_id.contains(":failure_gate:") => {
+            Some(request.clone())
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(request.questions.len(), 1);
+    let question = &request.questions[0];
+    assert_eq!(question.id, "spine_spawn_failure_action");
+    assert!(question.question.contains("spawned branches failed"));
+    assert_eq!(
+        question
+            .options
+            .as_ref()
+            .expect("spawn failure gate options")
+            .iter()
+            .map(|option| option.label.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Continue", "Retry", "Abandon"]
+    );
+
+    let response = RequestUserInputResponse {
+        answers: HashMap::from([(
+            question.id.clone(),
+            RequestUserInputAnswer {
+                answers: answers.iter().map(ToString::to_string).collect(),
+            },
+        )]),
+    };
+    test.codex
+        .submit(Op::UserInputAnswer {
+            id: request.turn_id,
+            response,
+        })
+        .await?;
+    Ok(())
+}
+
+async fn submit_turn_with_spawn_failure_action(
+    test: &TestCodex,
+    prompt: &str,
+    answers: &[&str],
+) -> Result<bool> {
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnStarted(_))
+    })
+    .await;
+    choose_spawn_failure_action(test, answers).await?;
+    let followup_gate = wait_for_event_match(&test.codex, |event| match event {
+        EventMsg::TurnComplete(_) => Some(None),
+        EventMsg::RequestUserInput(request) if request.call_id.contains(":failure_gate:") => {
+            Some(Some(request.clone()))
+        }
+        _ => None,
+    })
+    .await;
+    if let Some(request) = followup_gate {
+        let question = &request.questions[0];
+        test.codex
+            .submit(Op::UserInputAnswer {
+                id: request.turn_id,
+                response: RequestUserInputResponse {
+                    answers: HashMap::from([(
+                        question.id.clone(),
+                        RequestUserInputAnswer {
+                            answers: vec!["Abandon".to_string()],
+                        },
+                    )]),
+                },
+            })
+            .await?;
+        wait_for_event(&test.codex, |event| {
+            matches!(event, EventMsg::TurnComplete(_))
+        })
+        .await;
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 async fn wait_for_code_mode_first_output(test: &TestCodex, outer_exec_call_id: &str) -> Result<()> {
@@ -583,32 +686,443 @@ async fn spawn_starts_batch_concurrently_and_orders_reverse_completion_impl() ->
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn failed_child_salvage_preserves_memory_and_cache_key() -> Result<()> {
+async fn failed_child_abandon_returns_diagnostic_without_salvage() -> Result<()> {
     let server = start_mock_server().await;
-    let parent_prompt = "run a spawn batch with failure salvage";
+    let parent_prompt = "run a spawn batch and abandon failed branches";
     mount_sse_once_match(
         &server,
         move |request: &wiremock::Request| {
             body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
         },
         sse(vec![
-            ev_response_created("salvage-parent-response"),
+            ev_response_created("gate-parent-response"),
             ev_function_call_with_namespace(
                 SPAWN_CALL_ID,
                 SPAWN_NAMESPACE,
                 SPAWN_TOOL,
-                &spawn_args("salvage-first-child-marker", "salvage-second-child-marker"),
+                &spawn_args("gate-first-child-marker", "gate-second-child-marker"),
             ),
-            ev_completed("salvage-parent-response"),
+            ev_completed("gate-parent-response"),
+        ]),
+    )
+    .await;
+    let _failed_child = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "gate-first-child-marker"),
+        ResponseTemplate::new(503).set_body_json(json!({
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "selected model is at capacity"
+            }
+        })),
+    )
+    .await;
+    let _completed_child = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "gate-second-child-marker"),
+        sse(vec![
+            ev_response_created("gate-second-response"),
+            ev_assistant_message("gate-second-message", "second child completed"),
+            ev_completed("gate-second-response"),
+        ]),
+    )
+    .await;
+    let parent_followup = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && body_contains(request, "child errored")
+                && body_contains(request, "second child completed")
+        },
+        sse(vec![
+            ev_response_created("gate-parent-followup"),
+            ev_assistant_message("gate-parent-final", "abandoned failure observed"),
+            ev_completed("gate-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = spine_builder().build(&server).await?;
+    assert!(submit_turn_with_spawn_failure_action(&test, parent_prompt, &["Abandon"]).await?);
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| child_task_marker(request, "gate-first-child-marker"))
+            .count(),
+        1,
+        "Abandon must not issue a salvage or continuation request"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| child_task_marker(request, "gate-second-child-marker"))
+            .count(),
+        1
+    );
+    assert_eq!(parent_followup.requests().len(), 1);
+    let receipt: SpawnReceipt =
+        serde_json::from_str(&persisted_function_call_output(&test, SPAWN_CALL_ID)?)?;
+    assert_eq!(receipt.results.len(), 2);
+    assert_eq!(
+        receipt.results[0].outcome,
+        codex_spine_core::SpawnOutcome::Errored
+    );
+    assert!(
+        receipt.results[0].memory_body.contains("child errored"),
+        "unexpected failed receipt: {:?}",
+        receipt.results[0]
+    );
+    assert_eq!(
+        receipt.results[1].outcome,
+        codex_spine_core::SpawnOutcome::Completed
+    );
+    assert_eq!(receipt.results[1].memory_body, "second child completed");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn partial_failure_gate_waits_for_every_branch_to_settle() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "wait for every branch before showing the failure gate";
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
+        },
+        sse(vec![
+            ev_response_created("settlement-gate-parent"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                SPAWN_NAMESPACE,
+                SPAWN_TOOL,
+                &spawn_args("settlement-fast-failure", "settlement-delayed-success"),
+            ),
+            ev_completed("settlement-gate-parent"),
         ]),
     )
     .await;
     mount_response_once_match(
         &server,
+        |request: &wiremock::Request| child_task_marker(request, "settlement-fast-failure"),
+        ResponseTemplate::new(503).set_body_json(json!({
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "fast branch failed"
+            }
+        })),
+    )
+    .await;
+
+    let delayed_arrived = std::sync::Arc::new(tokio::sync::Notify::new());
+    let responder_arrived = std::sync::Arc::clone(&delayed_arrived);
+    let delayed_release =
+        std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+    let responder_release = std::sync::Arc::clone(&delayed_release);
+    let delayed_success = sse_response(sse(vec![
+        ev_response_created("settlement-delayed-response"),
+        ev_assistant_message("settlement-delayed-message", "delayed branch completed"),
+        ev_completed("settlement-delayed-response"),
+    ]));
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses$"))
+        .and(|request: &wiremock::Request| child_task_marker(request, "settlement-delayed-success"))
+        .respond_with(move |_: &wiremock::Request| {
+            responder_arrived.notify_one();
+            let (released, release_signal) = &*responder_release;
+            let guard = released.lock().expect("delayed response release lock");
+            let guard = release_signal
+                .wait_while(guard, |released| !*released)
+                .expect("delayed response release wait");
+            drop(guard);
+            delayed_success.clone()
+        })
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let parent_followup = mount_sse_once_match(
+        &server,
         |request: &wiremock::Request| {
-            child_task_marker(request, "salvage-first-child-marker")
-                && !body_contains(request, "failure-diagnostic")
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && body_contains(request, "child errored")
+                && body_contains(request, "delayed branch completed")
         },
+        sse(vec![
+            ev_response_created("settlement-parent-followup"),
+            ev_assistant_message("settlement-parent-final", "settled gate observed"),
+            ev_completed("settlement-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = spine_builder().build(&server).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: parent_prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnStarted(_))
+    })
+    .await;
+    tokio::time::timeout(Duration::from_secs(5), delayed_arrived.notified())
+        .await
+        .context("delayed branch never reached its response gate")?;
+
+    let premature_gate = tokio::time::timeout(
+        Duration::from_millis(200),
+        wait_for_event_match(&test.codex, |event| match event {
+            EventMsg::RequestUserInput(request) if request.call_id.contains(":failure_gate:") => {
+                Some(request.clone())
+            }
+            _ => None,
+        }),
+    )
+    .await;
+    let gate_was_premature = premature_gate.is_ok();
+    {
+        let (released, release_signal) = &*delayed_release;
+        let mut released = released.lock().expect("delayed response release lock");
+        *released = true;
+        release_signal.notify_all();
+    }
+    assert!(
+        !gate_was_premature,
+        "the Gate appeared before the delayed success branch settled"
+    );
+    choose_spawn_failure_action(&test, &["Abandon"]).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(parent_followup.requests().len(), 1);
+    let receipt: SpawnReceipt =
+        serde_json::from_str(&persisted_function_call_output(&test, SPAWN_CALL_ID)?)?;
+    assert_eq!(
+        receipt.results[0].outcome,
+        codex_spine_core::SpawnOutcome::Errored
+    );
+    assert_eq!(receipt.results[1].memory_body, "delayed branch completed");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupted_child_enters_the_failure_gate_without_interrupting_parent() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "interrupt one spawned branch and abandon it at the gate";
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
+        },
+        sse(vec![
+            ev_response_created("child-interrupt-parent"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                SPAWN_NAMESPACE,
+                SPAWN_TOOL,
+                &spawn_args("child-interrupt-target", "child-interrupt-success"),
+            ),
+            ev_completed("child-interrupt-parent"),
+        ]),
+    )
+    .await;
+    let child_shell_args = json!({
+        "command": "sleep 60",
+        "timeout_ms": 60_000
+    })
+    .to_string();
+    let interrupted_child = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            child_task_marker(request, "child-interrupt-target")
+                && body_contains(request, "You are: first")
+        },
+        sse(vec![
+            ev_response_created("child-interrupt-pause-response"),
+            ev_function_call(
+                "child-interrupt-pause-call",
+                "shell_command",
+                &child_shell_args,
+            ),
+            ev_completed("child-interrupt-pause-response"),
+        ]),
+    )
+    .await;
+    let completed_child = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            child_task_marker(request, "child-interrupt-success")
+                && body_contains(request, "You are: second")
+        },
+        sse(vec![
+            ev_response_created("child-interrupt-success-response"),
+            ev_assistant_message(
+                "child-interrupt-success-message",
+                "sibling completed before gate",
+            ),
+            ev_completed("child-interrupt-success-response"),
+        ]),
+    )
+    .await;
+    let parent_followup = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && body_contains(request, "child interrupted")
+                && body_contains(request, "sibling completed before gate")
+        },
+        sse(vec![
+            ev_response_created("child-interrupt-parent-followup"),
+            ev_assistant_message(
+                "child-interrupt-parent-final",
+                "child interruption observed",
+            ),
+            ev_completed("child-interrupt-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = spine_builder().build(&server).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: parent_prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnStarted(_))
+    })
+    .await;
+    wait_for_request(&interrupted_child, "child to interrupt", |request| {
+        body_has_child_task_marker(&request.body_json(), "child-interrupt-target")
+            && request.body_contains_text("You are: first")
+    })
+    .await?;
+    let interrupted_request = interrupted_child
+        .requests()
+        .into_iter()
+        .find(|request| {
+            body_has_child_task_marker(&request.body_json(), "child-interrupt-target")
+                && request.body_contains_text("You are: first")
+        })
+        .context("interrupted child request")?;
+    let interrupted_thread_id = codex_protocol::ThreadId::from_string(
+        interrupted_request.body_json()["client_metadata"]["thread_id"]
+            .as_str()
+            .context("interrupted child request thread id")?,
+    )?;
+    let child_thread = test
+        .thread_manager
+        .get_thread(interrupted_thread_id)
+        .await?;
+    wait_for_event(&child_thread, |event| {
+        matches!(event, EventMsg::ExecCommandBegin(_))
+    })
+    .await;
+    child_thread.submit(Op::Interrupt).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if child_thread.agent_status().await == AgentStatus::Interrupted {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("interrupted child did not reach its terminal status")?;
+    wait_for_request(&completed_child, "sibling to complete", |request| {
+        request.body_contains_text("You are: second")
+    })
+    .await?;
+    let completed_request = completed_child
+        .requests()
+        .into_iter()
+        .find(|request| request.body_contains_text("You are: second"))
+        .context("completed sibling request")?;
+    let completed_thread_id = codex_protocol::ThreadId::from_string(
+        completed_request.body_json()["client_metadata"]["thread_id"]
+            .as_str()
+            .context("completed sibling request thread id")?,
+    )?;
+    let completed_thread = test.thread_manager.get_thread(completed_thread_id).await?;
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if matches!(
+                completed_thread.agent_status().await,
+                AgentStatus::Completed(_)
+            ) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .context("successful sibling did not reach its terminal status")?;
+
+    choose_spawn_failure_action(&test, &["Abandon"]).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnComplete(_))
+    })
+    .await;
+
+    assert_eq!(parent_followup.requests().len(), 1);
+    assert_ne!(test.codex.agent_status().await, AgentStatus::Interrupted);
+    let receipt: SpawnReceipt =
+        serde_json::from_str(&persisted_function_call_output(&test, SPAWN_CALL_ID)?)?;
+    assert_eq!(
+        receipt.results[0].outcome,
+        codex_spine_core::SpawnOutcome::Aborted
+    );
+    assert_eq!(
+        receipt.results[1].memory_body,
+        "sibling completed before gate"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn interrupting_the_failure_gate_tears_down_every_child() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "run a spawn batch and interrupt its failure gate";
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
+        },
+        sse(vec![
+            ev_response_created("gate-interrupt-parent"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                SPAWN_NAMESPACE,
+                SPAWN_TOOL,
+                &spawn_args("gate-interrupt-failed", "gate-interrupt-completed"),
+            ),
+            ev_completed("gate-interrupt-parent"),
+        ]),
+    )
+    .await;
+    mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "gate-interrupt-failed"),
         ResponseTemplate::new(503).set_body_json(json!({
             "error": {
                 "code": "server_is_overloaded",
@@ -619,106 +1133,508 @@ async fn failed_child_salvage_preserves_memory_and_cache_key() -> Result<()> {
     .await;
     mount_sse_once_match(
         &server,
-        |request: &wiremock::Request| {
-            child_task_marker(request, "salvage-first-child-marker")
-                && body_contains(request, "failure-diagnostic")
-        },
+        |request: &wiremock::Request| child_task_marker(request, "gate-interrupt-completed"),
         sse(vec![
-            ev_response_created("salvage-memory-response"),
-            ev_assistant_message(
-                "salvage-memory-message",
-                "confirmed progress survived the upstream failure",
-            ),
-            ev_completed("salvage-memory-response"),
-        ]),
-    )
-    .await;
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| child_task_marker(request, "salvage-second-child-marker"),
-        sse(vec![
-            ev_response_created("salvage-second-response"),
-            ev_assistant_message("salvage-second-message", "second child completed"),
-            ev_completed("salvage-second-response"),
-        ]),
-    )
-    .await;
-    mount_sse_once_match(
-        &server,
-        |request: &wiremock::Request| {
-            !body_contains(request, BRANCH_PROMPT_MARKER)
-                && body_contains(request, "confirmed progress survived the upstream failure")
-                && body_contains(request, "child errored")
-        },
-        sse(vec![
-            ev_response_created("salvage-parent-followup"),
-            ev_assistant_message("salvage-parent-final", "failure salvage observed"),
-            ev_completed("salvage-parent-followup"),
+            ev_response_created("gate-interrupt-child"),
+            ev_assistant_message("gate-interrupt-message", "completed before the gate"),
+            ev_completed("gate-interrupt-child"),
         ]),
     )
     .await;
 
     let test = spine_builder().build(&server).await?;
-    test.submit_turn(parent_prompt).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: parent_prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnStarted(_))
+    })
+    .await;
+    wait_for_event(&test.codex, |event| {
+        matches!(
+            event,
+            EventMsg::RequestUserInput(request)
+                if request.call_id.contains(":failure_gate:")
+        )
+    })
+    .await;
+    assert_eq!(test.thread_manager.list_thread_ids().await.len(), 3);
+
+    test.codex.submit(Op::Interrupt).await?;
+    wait_for_event(&test.codex, |event| {
+        matches!(event, EventMsg::TurnAborted(_))
+    })
+    .await;
+    assert_eq!(
+        test.thread_manager.list_thread_ids().await.len(),
+        1,
+        "TurnAborted must follow complete failure-gate teardown"
+    );
+    assert_eq!(test.codex.agent_status().await, AgentStatus::Interrupted);
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_child_continue_resumes_the_same_thread() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "run a spawn batch and continue the failed branch";
+    let user_guidance = "preserve the partial analysis from the failed turn";
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
+        },
+        sse(vec![
+            ev_response_created("continue-parent-response"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                SPAWN_NAMESPACE,
+                SPAWN_TOOL,
+                &spawn_args("continue-first-marker", "continue-second-marker"),
+            ),
+            ev_completed("continue-parent-response"),
+        ]),
+    )
+    .await;
+    let failed_child = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            child_task_marker(request, "continue-first-marker")
+                && !body_contains(request, CONTINUE_AFTER_FAILURE_MESSAGE)
+        },
+        ResponseTemplate::new(503).set_body_json(json!({
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "selected model is at capacity"
+            }
+        })),
+    )
+    .await;
+    let continued_child = mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, CONTINUE_AFTER_FAILURE_MESSAGE)
+                && body_contains(request, user_guidance)
+        },
+        sse(vec![
+            ev_response_created("continued-child-response"),
+            ev_assistant_message("continued-child-message", "continued branch memory"),
+            ev_completed("continued-child-response"),
+        ]),
+    )
+    .await;
+    let completed_child = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "continue-second-marker"),
+        sse(vec![
+            ev_response_created("continue-second-response"),
+            ev_assistant_message("continue-second-message", "untouched success memory"),
+            ev_completed("continue-second-response"),
+        ]),
+    )
+    .await;
+    let parent_followup = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && body_contains(request, "continued branch memory")
+                && body_contains(request, "untouched success memory")
+        },
+        sse(vec![
+            ev_response_created("continue-parent-followup"),
+            ev_assistant_message("continue-parent-final", "continued failure observed"),
+            ev_completed("continue-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = spine_builder().build(&server).await?;
+    let completed_after_continue = submit_turn_with_spawn_failure_action(
+        &test,
+        parent_prompt,
+        &["Continue", &format!("user_note: {user_guidance}")],
+    )
+    .await?;
+
+    if !completed_after_continue {
+        let requests = server.received_requests().await.unwrap_or_default();
+        eprintln!(
+            "requests after failed Continue:\n{}",
+            requests
+                .iter()
+                .filter_map(decoded_body)
+                .filter_map(|body| serde_json::from_slice::<Value>(&body).ok())
+                .map(|body| {
+                    json!({
+                        "prompt_cache_key": body["prompt_cache_key"],
+                        "has_branch_marker": body.to_string().contains(BRANCH_PROMPT_MARKER),
+                        "has_continue_marker": body.to_string().contains("Continue the same assignment"),
+                        "input": body["input"],
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n---\n")
+        );
+        eprintln!(
+            "failed={} continued={} completed={} parent={}",
+            failed_child.requests().len(),
+            continued_child.requests().len(),
+            completed_child.requests().len(),
+            parent_followup.requests().len()
+        );
+    }
+    assert!(
+        completed_after_continue,
+        "Continue should resolve the failed branch"
+    );
 
     let requests = server.received_requests().await.unwrap_or_default();
-    let failed_requests = requests
+    let initial_requests = requests
         .iter()
         .filter(|request| {
-            child_task_marker(request, "salvage-first-child-marker")
-                && !body_contains(request, "failure-diagnostic")
+            child_task_marker(request, "continue-first-marker")
+                && !body_contains(request, CONTINUE_AFTER_FAILURE_MESSAGE)
         })
         .collect::<Vec<_>>();
-    let salvage_requests = requests
+    let continued_requests = requests
         .iter()
-        .filter(|request| {
-            child_task_marker(request, "salvage-first-child-marker")
-                && body_contains(request, "failure-diagnostic")
-        })
+        .filter(|request| body_contains(request, CONTINUE_AFTER_FAILURE_MESSAGE))
         .collect::<Vec<_>>();
-    let second_child_requests = requests
-        .iter()
-        .filter(|request| child_task_marker(request, "salvage-second-child-marker"))
-        .collect::<Vec<_>>();
-    let parent_followup_requests = requests
-        .iter()
-        .filter(|request| {
-            !body_contains(request, BRANCH_PROMPT_MARKER)
-                && body_contains(request, "confirmed progress survived the upstream failure")
-                && body_contains(request, "child errored")
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(failed_requests.len(), 1);
-    assert_eq!(salvage_requests.len(), 1);
-    assert_eq!(second_child_requests.len(), 1);
-    assert_eq!(parent_followup_requests.len(), 1);
+    assert_eq!(initial_requests.len(), 1);
+    assert_eq!(continued_requests.len(), 1);
+    assert!(body_contains(continued_requests[0], user_guidance));
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| child_task_marker(request, "continue-second-marker"))
+            .count(),
+        1,
+        "the successful branch must not run again"
+    );
+    assert_eq!(parent_followup.requests().len(), 1);
+    let initial_body: Value = serde_json::from_slice(
+        &decoded_body(initial_requests[0]).expect("initial child request body"),
+    )?;
+    let continued_body: Value = serde_json::from_slice(
+        &decoded_body(continued_requests[0]).expect("continued child request body"),
+    )?;
+    assert_eq!(
+        initial_body["prompt_cache_key"], continued_body["prompt_cache_key"],
+        "Continue must reuse the failed child thread and cache affinity"
+    );
+    assert_eq!(
+        initial_body["client_metadata"]["thread_id"],
+        continued_body["client_metadata"]["thread_id"],
+        "Continue must submit a new turn to the same failed child thread"
+    );
+    let receipt: SpawnReceipt =
+        serde_json::from_str(&persisted_function_call_output(&test, SPAWN_CALL_ID)?)?;
+    assert!(
+        receipt
+            .results
+            .iter()
+            .all(|result| result.outcome == codex_spine_core::SpawnOutcome::Completed)
+    );
+    assert_eq!(receipt.results[0].memory_body, "continued branch memory");
+    assert_eq!(receipt.results[1].memory_body, "untouched success memory");
 
-    let failed_request = failed_requests[0];
-    let salvage_request = salvage_requests[0];
-    let failed_body: Value =
-        serde_json::from_slice(&decoded_body(failed_request).expect("failed request body"))?;
-    let salvage_body: Value =
-        serde_json::from_slice(&decoded_body(salvage_request).expect("salvage request body"))?;
-    assert_eq!(
-        failed_body["prompt_cache_key"], salvage_body["prompt_cache_key"],
-        "salvage must retain the failed child cache key"
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_continue_returns_to_the_gate_for_the_remaining_failure() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "continue a failed branch that fails again";
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
+        },
+        sse(vec![
+            ev_response_created("repeat-gate-parent"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                SPAWN_NAMESPACE,
+                SPAWN_TOOL,
+                &spawn_args("repeat-gate-first", "repeat-gate-second"),
+            ),
+            ev_completed("repeat-gate-parent"),
+        ]),
+    )
+    .await;
+    mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            child_task_marker(request, "repeat-gate-first")
+                && !body_contains(request, CONTINUE_AFTER_FAILURE_MESSAGE)
+        },
+        ResponseTemplate::new(503).set_body_json(json!({
+            "error": {"code": "server_is_overloaded", "message": "first failure"}
+        })),
+    )
+    .await;
+    mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| body_contains(request, CONTINUE_AFTER_FAILURE_MESSAGE),
+        ResponseTemplate::new(503).set_body_json(json!({
+            "error": {"code": "server_is_overloaded", "message": "second failure"}
+        })),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "repeat-gate-second"),
+        sse(vec![
+            ev_response_created("repeat-gate-success"),
+            ev_assistant_message("repeat-gate-success-message", "stable success memory"),
+            ev_completed("repeat-gate-success"),
+        ]),
+    )
+    .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && has_function_call_output(request, SPAWN_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("repeat-gate-parent-followup"),
+            ev_assistant_message("repeat-gate-parent-final", "repeated gate observed"),
+            ev_completed("repeat-gate-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = spine_builder().build(&server).await?;
+    assert!(
+        !submit_turn_with_spawn_failure_action(&test, parent_prompt, &["Continue"]).await?,
+        "a second failure must reopen the Gate before the test abandons it"
     );
-    assert_eq!(salvage_body["tool_choice"], "none");
-    assert_eq!(failed_body["instructions"], salvage_body["instructions"]);
-    assert_eq!(failed_body["tools"], salvage_body["tools"]);
-    let failed_input = failed_body["input"].as_array().expect("failed input array");
-    let salvage_input = salvage_body["input"]
-        .as_array()
-        .expect("salvage input array");
+    let receipt: SpawnReceipt =
+        serde_json::from_str(&persisted_function_call_output(&test, SPAWN_CALL_ID)?)?;
     assert_eq!(
-        &salvage_input[..failed_input.len()],
-        failed_input.as_slice(),
-        "salvage must preserve the failed request input as an exact prefix"
+        receipt.results[0].outcome,
+        codex_spine_core::SpawnOutcome::Errored
     );
-    assert_eq!(salvage_input.len(), failed_input.len() + 1);
+    assert_eq!(receipt.results[1].memory_body, "stable success memory");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_child_retry_starts_a_fresh_branch() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "run a spawn batch and retry the failed branch";
+    let user_guidance = "use the fallback source on this retry";
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
+        },
+        sse(vec![
+            ev_response_created("retry-parent-response"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                SPAWN_NAMESPACE,
+                SPAWN_TOOL,
+                &spawn_args("retry-first-marker", "retry-second-marker"),
+            ),
+            ev_completed("retry-parent-response"),
+        ]),
+    )
+    .await;
+
+    let attempt = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let responder_attempt = std::sync::Arc::clone(&attempt);
+    let retry_success = sse_response(sse(vec![
+        ev_response_created("retried-child-response"),
+        ev_assistant_message("retried-child-message", "retried branch memory"),
+        ev_completed("retried-child-response"),
+    ]));
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .and(wiremock::matchers::path_regex(".*/responses$"))
+        .and(|request: &wiremock::Request| child_task_marker(request, "retry-first-marker"))
+        .respond_with(move |_: &wiremock::Request| {
+            if responder_attempt.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).set_body_json(json!({
+                    "error": {
+                        "code": "server_is_overloaded",
+                        "message": "selected model is at capacity"
+                    }
+                }))
+            } else {
+                retry_success.clone()
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+    mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "retry-second-marker"),
+        sse(vec![
+            ev_response_created("retry-second-response"),
+            ev_assistant_message("retry-second-message", "retry untouched success"),
+            ev_completed("retry-second-response"),
+        ]),
+    )
+    .await;
+    let parent_followup = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && body_contains(request, "retried branch memory")
+                && body_contains(request, "retry untouched success")
+        },
+        sse(vec![
+            ev_response_created("retry-parent-followup"),
+            ev_assistant_message("retry-parent-final", "retried failure observed"),
+            ev_completed("retry-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = spine_builder().build(&server).await?;
+    assert!(
+        submit_turn_with_spawn_failure_action(
+            &test,
+            parent_prompt,
+            &["Retry", &format!("user_note: {user_guidance}")],
+        )
+        .await?
+    );
+
+    let requests = server.received_requests().await.unwrap_or_default();
+    let retry_requests = requests
+        .iter()
+        .filter(|request| child_task_marker(request, "retry-first-marker"))
+        .collect::<Vec<_>>();
+    assert_eq!(retry_requests.len(), 2);
     assert_eq!(
-        salvage_input.last().and_then(|item| item["role"].as_str()),
-        Some("developer")
+        retry_requests
+            .iter()
+            .filter(|request| body_contains(request, user_guidance))
+            .count(),
+        1,
+        "Retry guidance must apply only to the fresh attempt"
+    );
+    assert!(
+        retry_requests
+            .iter()
+            .all(|request| !body_contains(request, CONTINUE_AFTER_FAILURE_MESSAGE)),
+        "Retry must replay the original assignment rather than continuing the old thread"
+    );
+    let retry_thread_ids = retry_requests
+        .iter()
+        .map(|request| {
+            decoded_body(request)
+                .and_then(|body| serde_json::from_slice::<Value>(&body).ok())
+                .and_then(|body| {
+                    body["client_metadata"]["thread_id"]
+                        .as_str()
+                        .map(str::to_string)
+                })
+                .expect("retry request thread id")
+        })
+        .collect::<Vec<_>>();
+    assert_ne!(
+        retry_thread_ids[0], retry_thread_ids[1],
+        "Retry must create a fresh child thread"
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| child_task_marker(request, "retry-second-marker"))
+            .count(),
+        1,
+        "the successful branch must not run again"
+    );
+    assert_eq!(parent_followup.requests().len(), 1);
+    let receipt: SpawnReceipt =
+        serde_json::from_str(&persisted_function_call_output(&test, SPAWN_CALL_ID)?)?;
+    assert!(
+        receipt
+            .results
+            .iter()
+            .all(|result| result.outcome == codex_spine_core::SpawnOutcome::Completed)
+    );
+    assert_eq!(receipt.results[0].memory_body, "retried branch memory");
+    assert_eq!(receipt.results[1].memory_body, "retry untouched success");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_failed_children_share_one_abandon_gate() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "run a spawn batch where every branch fails";
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt) && !body_contains(request, BRANCH_PROMPT_MARKER)
+        },
+        sse(vec![
+            ev_response_created("all-failed-parent-response"),
+            ev_function_call_with_namespace(
+                SPAWN_CALL_ID,
+                SPAWN_NAMESPACE,
+                SPAWN_TOOL,
+                &spawn_args("all-failed-first", "all-failed-second"),
+            ),
+            ev_completed("all-failed-parent-response"),
+        ]),
+    )
+    .await;
+    for marker in ["all-failed-first", "all-failed-second"] {
+        mount_response_once_match(
+            &server,
+            move |request: &wiremock::Request| child_task_marker(request, marker),
+            ResponseTemplate::new(503).set_body_json(json!({
+                "error": {
+                    "code": "server_is_overloaded",
+                    "message": format!("{marker} is at capacity")
+                }
+            })),
+        )
+        .await;
+    }
+    let parent_followup = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && has_function_call_output(request, SPAWN_CALL_ID)
+        },
+        sse(vec![
+            ev_response_created("all-failed-parent-followup"),
+            ev_assistant_message("all-failed-parent-final", "all failures observed"),
+            ev_completed("all-failed-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let test = spine_builder().build(&server).await?;
+    assert!(submit_turn_with_spawn_failure_action(&test, parent_prompt, &["Abandon"]).await?);
+
+    assert_eq!(parent_followup.requests().len(), 1);
+    let receipt: SpawnReceipt =
+        serde_json::from_str(&persisted_function_call_output(&test, SPAWN_CALL_ID)?)?;
+    assert_eq!(receipt.results.len(), 2);
+    assert!(
+        receipt
+            .results
+            .iter()
+            .all(|result| result.outcome == codex_spine_core::SpawnOutcome::Errored)
     );
 
     Ok(())
@@ -918,6 +1834,112 @@ text(JSON.stringify({left, right, spawned}));
     assert_eq!(receipt.results.len(), 2);
     assert_eq!(receipt.results[0].memory_body, "nested first memory");
     assert_eq!(receipt.results[1].memory_body, "nested second memory");
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn failed_nested_spawn_returns_to_its_parent_without_a_user_gate() -> Result<()> {
+    let server = start_mock_server().await;
+    let parent_prompt = "run a nested Spine spawn with one failed child";
+    let code = r#"// @exec: {"yield_time_ms": 30000}
+const spawned = await tools.spine__spawn({
+  tasks: [
+    {summary: "failed", prompt: "nested-failure-child-marker"},
+    {summary: "success", prompt: "nested-failure-success-marker"},
+  ],
+});
+text(String(spawned));
+"#;
+    mount_sse_once_match(
+        &server,
+        move |request: &wiremock::Request| {
+            body_contains(request, parent_prompt)
+                && !body_contains(request, BRANCH_PROMPT_MARKER)
+                && !body_contains(request, "exec-nested-failure")
+        },
+        sse(vec![
+            ev_response_created("nested-failure-parent-response"),
+            ev_custom_tool_call("exec-nested-failure", "exec", code),
+            ev_completed("nested-failure-parent-response"),
+        ]),
+    )
+    .await;
+    let failed_child = mount_response_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "nested-failure-child-marker"),
+        ResponseTemplate::new(503).set_body_json(json!({
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "nested child forced failure"
+            }
+        })),
+    )
+    .await;
+    let successful_child = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| child_task_marker(request, "nested-failure-success-marker"),
+        sse(vec![
+            ev_response_created("nested-failure-success-response"),
+            ev_assistant_message(
+                "nested-failure-success-message",
+                "nested sibling success memory",
+            ),
+            ev_completed("nested-failure-success-response"),
+        ]),
+    )
+    .await;
+    let parent_followup = mount_sse_once_match(
+        &server,
+        |request: &wiremock::Request| {
+            !body_contains(request, BRANCH_PROMPT_MARKER)
+                && body_contains(request, "child errored")
+                && body_contains(request, "nested sibling success memory")
+        },
+        sse(vec![
+            ev_response_created("nested-failure-parent-followup"),
+            ev_assistant_message("nested-failure-parent-final", "nested failure handled"),
+            ev_completed("nested-failure-parent-followup"),
+        ]),
+    )
+    .await;
+
+    let mut builder = nested_spawn_builder();
+    let test = builder.build(&server).await?;
+    test.codex
+        .submit(Op::UserInput {
+            items: vec![UserInput::Text {
+                text: parent_prompt.to_string(),
+                text_elements: Vec::new(),
+            }],
+            final_output_json_schema: None,
+            responsesapi_client_metadata: None,
+            additional_context: Default::default(),
+            thread_settings: Default::default(),
+        })
+        .await?;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = test.codex.next_event().await?;
+            match event.msg {
+                EventMsg::RequestUserInput(request)
+                    if request.call_id.contains(":failure_gate:") =>
+                {
+                    anyhow::bail!("nested spawn unexpectedly requested a user failure action")
+                }
+                EventMsg::TurnComplete(_) => return Ok::<_, anyhow::Error>(()),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .context("nested failure turn did not complete without a Gate")??;
+    test.codex.flush_rollout().await?;
+
+    assert_eq!(failed_child.requests().len(), 1);
+    assert_eq!(successful_child.requests().len(), 1);
+    assert_eq!(parent_followup.requests().len(), 1);
 
     Ok(())
 }

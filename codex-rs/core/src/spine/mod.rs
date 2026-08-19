@@ -36,7 +36,7 @@ pub(crate) mod memory_projection;
 pub(crate) mod pressure;
 pub(crate) mod rollout_debug;
 pub(crate) mod spawn;
-pub(crate) mod spawn_salvage;
+pub(crate) mod spawn_gate;
 pub(crate) mod status;
 pub(crate) mod tool_response;
 

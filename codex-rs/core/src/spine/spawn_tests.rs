@@ -163,51 +163,19 @@ fn coordinator_helpers_keep_safe_names_and_truthful_terminal_results() {
         0,
         thread_id,
         AgentStatus::Completed(Some("final memory".to_string())),
-        None,
     );
     assert_eq!(completed.outcome, SpawnOutcome::Completed);
     assert_eq!(completed.memory_body, "final memory");
     assert_eq!(completed.diagnostic, None);
 
-    let missing = result_from_status(1, thread_id, AgentStatus::Completed(None), None);
+    let missing = result_from_status(1, thread_id, AgentStatus::Completed(None));
     assert_eq!(missing.outcome, SpawnOutcome::Errored);
     assert!(missing.diagnostic.is_some());
     assert!(!missing.memory_body.trim().is_empty());
 
     assert!(is_spawn_terminal(&AgentStatus::Interrupted));
-    let interrupted = result_from_status(2, thread_id, AgentStatus::Interrupted, None);
+    let interrupted = result_from_status(2, thread_id, AgentStatus::Interrupted);
     assert_eq!(interrupted.outcome, SpawnOutcome::Aborted);
-
-    let salvaged = result_from_status(
-        3,
-        thread_id,
-        AgentStatus::Completed(None),
-        Some(crate::spine::spawn_salvage::SpawnFailureRecord {
-            diagnostic: "upstream 503".to_string(),
-            salvaged_memory: Some("progress before failure".to_string()),
-        }),
-    );
-    assert_eq!(salvaged.outcome, SpawnOutcome::Errored);
-    assert_eq!(salvaged.memory_body, "progress before failure");
-    assert_eq!(
-        salvaged.diagnostic.as_deref(),
-        Some("child errored: upstream 503")
-    );
-
-    let salvage_failed = result_from_status(
-        4,
-        thread_id,
-        AgentStatus::Errored("upstream 503".to_string()),
-        Some(crate::spine::spawn_salvage::SpawnFailureRecord {
-            diagnostic: "upstream 503".to_string(),
-            salvaged_memory: None,
-        }),
-    );
-    assert_eq!(salvage_failed.outcome, SpawnOutcome::Errored);
-    assert_eq!(
-        salvage_failed.memory_body,
-        salvage_failed.diagnostic.expect("original diagnostic")
-    );
 }
 
 #[test]
@@ -229,6 +197,16 @@ fn subtree_membership_uses_agent_path_segment_boundaries() {
     assert!(!path_is_in_subtree(
         &AgentPath::try_from("/root/other/spawn_a").unwrap(),
         &root,
+    ));
+}
+
+#[test]
+fn failure_gate_is_limited_to_explicit_root_spawn_transactions() {
+    assert!(should_show_failure_gate(true, &AgentPath::root()));
+    assert!(!should_show_failure_gate(false, &AgentPath::root()));
+    assert!(!should_show_failure_gate(
+        true,
+        &AgentPath::try_from("/root/child").unwrap()
     ));
 }
 
@@ -292,7 +270,7 @@ fn terminal_status_matrix_produces_one_total_ordered_receipt() {
         .into_iter()
         .enumerate()
         .map(|(ordinal, status)| {
-            let result = result_from_status(ordinal, codex_protocol::ThreadId::new(), status, None);
+            let result = result_from_status(ordinal, codex_protocol::ThreadId::new(), status);
             let progress_status = result_status(&result);
             (Some(result), progress_status)
         })
