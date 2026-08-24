@@ -7,6 +7,7 @@ const MCP_TOOL_THREAD_ID_META_KEY: &str = "threadId";
 pub(crate) struct McpRequestProcessor {
     auth_manager: Arc<AuthManager>,
     thread_manager: Arc<ThreadManager>,
+    spine_ui: crate::spine_ui::SpineUiMcpHandler,
     outgoing: Arc<OutgoingMessageSender>,
     config_manager: ConfigManager,
 }
@@ -15,11 +16,18 @@ impl McpRequestProcessor {
     pub(crate) fn new(
         auth_manager: Arc<AuthManager>,
         thread_manager: Arc<ThreadManager>,
+        thread_state_manager: ThreadStateManager,
         outgoing: Arc<OutgoingMessageSender>,
         config_manager: ConfigManager,
     ) -> Self {
         Self {
             auth_manager,
+            spine_ui: crate::spine_ui::SpineUiMcpHandler::new(
+                thread_state_manager,
+                Arc::clone(&thread_manager),
+                Arc::clone(&outgoing),
+                config_manager.clone(),
+            ),
             thread_manager,
             outgoing,
             config_manager,
@@ -259,6 +267,7 @@ impl McpRequestProcessor {
             }
             None => (self.load_latest_config(/*fallback_cwd*/ None).await?, None),
         };
+        crate::spine_ui::SpineUiMcpHandler::ensure_reserved_name_available(&config)?;
         let mcp_manager = self.thread_manager.mcp_manager();
         let auth = self.auth_manager.auth().await;
         let (mcp_config, runtime_context) = match thread {
@@ -350,6 +359,7 @@ impl McpRequestProcessor {
         );
         server_names.sort();
         server_names.dedup();
+        crate::spine_ui::SpineUiMcpHandler::add_server_name(&mut server_names);
 
         let total = server_names.len();
         let limit = params.limit.unwrap_or(total as u32).max(1) as usize;
@@ -370,7 +380,7 @@ impl McpRequestProcessor {
 
         let end = start.saturating_add(effective_limit).min(total);
 
-        let data: Vec<McpServerStatus> = server_names[start..end]
+        let mut data: Vec<McpServerStatus> = server_names[start..end]
             .iter()
             .map(|name| McpServerStatus {
                 name: name.clone(),
@@ -385,6 +395,10 @@ impl McpRequestProcessor {
                     .into(),
             })
             .collect();
+        crate::spine_ui::SpineUiMcpHandler::replace_server_statuses(
+            &mut data,
+            matches!(detail, McpSnapshotDetail::Full),
+        );
 
         let next_cursor = if end < total {
             Some(end.to_string())
@@ -400,6 +414,10 @@ impl McpRequestProcessor {
         request_id: &ConnectionRequestId,
         params: McpResourceReadParams,
     ) -> Result<(), JSONRPCErrorError> {
+        if self.spine_ui.try_read_resource(request_id, &params).await? {
+            return Ok(());
+        }
+
         let outgoing = Arc::clone(&self.outgoing);
         let McpResourceReadParams {
             thread_id,
@@ -471,9 +489,12 @@ impl McpRequestProcessor {
         request_id: &ConnectionRequestId,
         params: McpServerToolCallParams,
     ) -> Result<(), JSONRPCErrorError> {
+        if self.spine_ui.try_call_tool(request_id, &params).await? {
+            return Ok(());
+        }
+        let (_, thread) = self.load_thread(&params.thread_id).await?;
         let outgoing = Arc::clone(&self.outgoing);
         let thread_id = params.thread_id.clone();
-        let (_, thread) = self.load_thread(&thread_id).await?;
         let meta = with_mcp_tool_call_thread_id_meta(params.meta, &thread_id);
         let request_id = request_id.clone();
 

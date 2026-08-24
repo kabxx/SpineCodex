@@ -79,6 +79,8 @@ mod skills_list;
 mod sleep;
 mod spine_compact_replay;
 mod spine_feedback;
+mod spine_ui_live;
+mod spine_ui_mcp;
 mod thread_archive;
 mod thread_delete;
 mod thread_fork;
